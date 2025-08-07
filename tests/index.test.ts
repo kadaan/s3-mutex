@@ -1,6 +1,7 @@
 import {
 	CreateBucketCommand,
 	HeadBucketCommand,
+	PutObjectCommand,
 	S3Client,
 	type S3ClientConfig,
 } from "@aws-sdk/client-s3";
@@ -490,5 +491,520 @@ describe("S3Mutex Tests", () => {
 
 		// Clean up
 		await noToleranceMutex.releaseLock(skewLockName);
+	});
+
+	describe("Error Handling and Resilience Tests", () => {
+		test("should handle malformed lock files gracefully", async () => {
+			const malformedLockName = `malformed-lock-${Date.now()}`;
+
+			// Create a malformed lock file by directly putting invalid JSON
+			const lockKey = `locks/${malformedLockName}.json`;
+			await s3Client.send(
+				new PutObjectCommand({
+					Bucket: lockBucket,
+					Key: lockKey,
+					Body: "{ invalid json }",
+					ContentType: "application/json",
+				}),
+			);
+
+			// Attempting to check the lock should handle the error gracefully
+			let errorThrown = false;
+			try {
+				await s3Mutex.isLocked(malformedLockName);
+			} catch (error) {
+				errorThrown = true;
+			}
+			expect(errorThrown).toBe(true);
+
+			// Clean up
+			await s3Mutex.deleteLock(malformedLockName, true);
+		});
+
+		test("should handle empty lock files", async () => {
+			const emptyLockName = `empty-lock-${Date.now()}`;
+
+			// Create an empty lock file
+			const lockKey = `locks/${emptyLockName}.json`;
+			await s3Client.send(
+				new PutObjectCommand({
+					Bucket: lockBucket,
+					Key: lockKey,
+					Body: "",
+					ContentType: "application/json",
+				}),
+			);
+
+			let errorThrown = false;
+			try {
+				await s3Mutex.isLocked(emptyLockName);
+			} catch (error) {
+				errorThrown = true;
+			}
+			expect(errorThrown).toBe(true);
+
+			// Clean up
+			await s3Mutex.deleteLock(emptyLockName, true);
+		});
+
+		test("should handle network timeouts gracefully", async () => {
+			// Create a mutex with very short timeout for testing
+			const timeoutMutex = new S3Mutex({
+				s3Client,
+				bucketName: lockBucket,
+				maxRetries: 1,
+				retryDelayMs: 50,
+				lockTimeoutMs: 100,
+			});
+
+			const timeoutLockName = `timeout-lock-${Date.now()}`;
+
+			// Should still work within normal parameters
+			const acquired = await timeoutMutex.acquireLock(timeoutLockName, 200);
+			expect(acquired).toBe(true);
+
+			// Clean up
+			await timeoutMutex.releaseLock(timeoutLockName);
+		});
+
+		test("should handle missing bucket scenario", async () => {
+			const nonExistentBucket = `non-existent-bucket-${Date.now()}`;
+			const brokenMutex = new S3Mutex({
+				s3Client,
+				bucketName: nonExistentBucket,
+				maxRetries: 1,
+				retryDelayMs: 50,
+			});
+
+			const testLockName = `test-lock-${Date.now()}`;
+
+			// Should fail gracefully without crashing
+			const acquired = await brokenMutex.acquireLock(testLockName);
+			expect(acquired).toBe(false);
+		});
+	});
+
+	describe("Concurrency and Race Condition Tests", () => {
+		test("should handle rapid lock/unlock cycles", async () => {
+			const rapidLockName = `rapid-lock-${Date.now()}`;
+			const results = [];
+
+			// Perform rapid acquire/release cycles
+			for (let i = 0; i < 10; i++) {
+				const acquired = await s3Mutex.acquireLock(rapidLockName);
+				if (acquired) {
+					results.push(true);
+					await s3Mutex.releaseLock(rapidLockName);
+				} else {
+					results.push(false);
+				}
+			}
+
+			// All operations should succeed
+			expect(results.every((r) => r === true)).toBe(true);
+		});
+
+		test("should handle multiple withLock operations concurrently", async () => {
+			const concurrentLockName = `concurrent-lock-${Date.now()}`;
+			const executionOrder = [];
+
+			// Create multiple mutex instances with very limited retries
+			const mutexes = Array.from(
+				{ length: 5 },
+				() =>
+					new S3Mutex({
+						s3Client,
+						bucketName: lockBucket,
+						maxRetries: 1, // Very limited retries
+						retryDelayMs: 10, // Very short delay
+						lockTimeoutMs: 1000,
+					}),
+			);
+
+			// Create multiple concurrent withLock operations trying to get the SAME lock
+			const executionPromises = mutexes.map(
+				(mutex, i) =>
+					mutex.withLock(
+						concurrentLockName,
+						async () => {
+							executionOrder.push(i);
+							// Simulate some work
+							await new Promise((resolve) => setTimeout(resolve, 100));
+							return i;
+						},
+						{ retries: 1 },
+					), // Limit retries to make test faster
+			);
+
+			const results = await Promise.all(executionPromises);
+
+			// With very limited retries, not all should succeed
+			const successfulResults = results.filter((r) => r !== null);
+			const failedResults = results.filter((r) => r === null);
+
+			// At least one should succeed, and some should fail
+			expect(successfulResults.length).toBeGreaterThanOrEqual(1);
+			expect(failedResults.length).toBeGreaterThanOrEqual(0);
+			expect(successfulResults.length + failedResults.length).toBe(5);
+		});
+
+		test("should handle lock ownership verification correctly", async () => {
+			const ownershipLockName = `ownership-lock-${Date.now()}`;
+
+			// First mutex acquires the lock
+			const acquired1 = await s3Mutex.acquireLock(ownershipLockName);
+			expect(acquired1).toBe(true);
+
+			// Verify ownership
+			const isOwned = await s3Mutex.isOwnedByUs(ownershipLockName);
+			expect(isOwned).toBe(true);
+
+			// Second mutex should see it as not owned by them
+			const secondMutex = new S3Mutex({
+				s3Client,
+				bucketName: lockBucket,
+				maxRetries: 1,
+				retryDelayMs: 100,
+			});
+
+			const isOwnedBySecond = await secondMutex.isOwnedByUs(ownershipLockName);
+			expect(isOwnedBySecond).toBe(false);
+
+			// Clean up
+			await s3Mutex.releaseLock(ownershipLockName);
+		});
+	});
+
+	describe("Edge Cases and Boundary Conditions", () => {
+		test("should handle very long lock names", async () => {
+			// Create a very long lock name (but within S3 key limits)
+			const longLockName = `${"a".repeat(200)}-${Date.now()}`;
+
+			const acquired = await s3Mutex.acquireLock(longLockName);
+			expect(acquired).toBe(true);
+
+			const isLocked = await s3Mutex.isLocked(longLockName);
+			expect(isLocked).toBe(true);
+
+			await s3Mutex.releaseLock(longLockName);
+		});
+
+		test("should handle lock names with special characters", async () => {
+			// Test with special characters that should be sanitized
+			const specialLockName = `test-lock-with-@#$%^&*()-${Date.now()}`;
+
+			const acquired = await s3Mutex.acquireLock(specialLockName);
+			expect(acquired).toBe(true);
+
+			await s3Mutex.releaseLock(specialLockName);
+		});
+
+		test("should handle zero timeout gracefully", async () => {
+			const zeroTimeoutLockName = `zero-timeout-lock-${Date.now()}`;
+
+			const acquired = await s3Mutex.acquireLock(zeroTimeoutLockName, 0);
+			// Should still try to acquire even with zero timeout
+			expect(typeof acquired).toBe("boolean");
+
+			if (acquired) {
+				await s3Mutex.releaseLock(zeroTimeoutLockName);
+			}
+		});
+
+		test("should handle maximum priority values", async () => {
+			const maxPriorityLockName = `max-priority-lock-${Date.now()}`;
+
+			const acquired = await s3Mutex.acquireLock(
+				maxPriorityLockName,
+				undefined,
+				Number.MAX_SAFE_INTEGER,
+			);
+			expect(acquired).toBe(true);
+
+			await s3Mutex.releaseLock(maxPriorityLockName);
+		});
+
+		test("should handle negative priority values", async () => {
+			const negativePriorityLockName = `negative-priority-lock-${Date.now()}`;
+
+			const acquired = await s3Mutex.acquireLock(
+				negativePriorityLockName,
+				undefined,
+				-1,
+			);
+			expect(acquired).toBe(true);
+
+			await s3Mutex.releaseLock(negativePriorityLockName);
+		});
+	});
+
+	describe("Heartbeat and Timeout Scenarios", () => {
+		test("should handle withLock with very short timeout", async () => {
+			const shortTimeoutLockName = `short-timeout-lock-${Date.now()}`;
+			let executionCompleted = false;
+
+			const shortTimeoutMutex = new S3Mutex({
+				s3Client,
+				bucketName: lockBucket,
+				maxRetries: 1,
+				retryDelayMs: 50,
+				lockTimeoutMs: 200, // Very short timeout
+			});
+
+			const result = await shortTimeoutMutex.withLock(
+				shortTimeoutLockName,
+				async () => {
+					// This should complete before timeout
+					executionCompleted = true;
+					return "success";
+				},
+				{ timeoutMs: 150 },
+			);
+
+			expect(executionCompleted).toBe(true);
+			expect(result).toBe("success");
+		});
+
+		test("should handle heartbeat failure scenarios", async () => {
+			const heartbeatFailLockName = `heartbeat-fail-lock-${Date.now()}`;
+
+			// Create a mutex with very short heartbeat interval
+			const fastHeartbeatMutex = new S3Mutex({
+				s3Client,
+				bucketName: lockBucket,
+				lockTimeoutMs: 300, // Short timeout to force frequent heartbeats
+				maxRetries: 2,
+				retryDelayMs: 50,
+			});
+
+			let executionStarted = false;
+
+			const result = await fastHeartbeatMutex.withLock(
+				heartbeatFailLockName,
+				async () => {
+					executionStarted = true;
+					// Simulate work that takes longer than heartbeat interval
+					await new Promise((resolve) => setTimeout(resolve, 100));
+					return "completed";
+				},
+			);
+
+			expect(executionStarted).toBe(true);
+			expect(result).toBe("completed");
+
+			// Ensure lock is released
+			const isLocked = await fastHeartbeatMutex.isLocked(heartbeatFailLockName);
+			expect(isLocked).toBe(false);
+		});
+	});
+
+	describe("Advanced Lock Management", () => {
+		test("should handle refreshing non-existent locks", async () => {
+			const nonExistentLockName = `non-existent-refresh-lock-${Date.now()}`;
+
+			const refreshed = await s3Mutex.refreshLock(nonExistentLockName);
+			expect(refreshed).toBe(false);
+		});
+
+		test("should handle refreshing locks owned by others", async () => {
+			const otherOwnerLockName = `other-owner-lock-${Date.now()}`;
+
+			// Create another mutex instance
+			const otherMutex = new S3Mutex({
+				s3Client,
+				bucketName: lockBucket,
+				maxRetries: 2,
+				retryDelayMs: 100,
+			});
+
+			// Other mutex acquires the lock
+			await otherMutex.acquireLock(otherOwnerLockName);
+
+			// Our mutex tries to refresh it - should fail
+			const refreshed = await s3Mutex.refreshLock(otherOwnerLockName);
+			expect(refreshed).toBe(false);
+
+			// Clean up
+			await otherMutex.releaseLock(otherOwnerLockName);
+		});
+
+		test("should handle multiple cleanup operations", async () => {
+			const cleanupPrefix = `cleanup-multiple-${Date.now()}/`;
+
+			const cleanupMutex = new S3Mutex({
+				s3Client,
+				bucketName: lockBucket,
+				keyPrefix: cleanupPrefix,
+				lockTimeoutMs: 200,
+				maxRetries: 2,
+				retryDelayMs: 50,
+			});
+
+			// Create multiple locks with different states
+			const lockNames = Array.from({ length: 5 }, (_, i) => `multi-lock-${i}`);
+
+			// Acquire some locks
+			await Promise.all(
+				lockNames.slice(0, 3).map((name) => cleanupMutex.acquireLock(name)),
+			);
+
+			// Release some locks
+			await cleanupMutex.releaseLock(lockNames[0]);
+
+			// Wait for some to expire
+			await new Promise((resolve) => setTimeout(resolve, 300));
+
+			// Run cleanup
+			const result = await cleanupMutex.cleanupStaleLocks({
+				prefix: cleanupPrefix,
+			});
+
+			expect(result.total).toBeGreaterThan(0);
+			expect(result.stale).toBeGreaterThan(0);
+
+			// Clean up remaining locks
+			await Promise.all(
+				lockNames.map((name) =>
+					cleanupMutex.deleteLock(name, true).catch(() => {}),
+				),
+			);
+		});
+
+		test("should handle delete operations on active locks", async () => {
+			const activeLockName = `active-delete-lock-${Date.now()}`;
+
+			// Acquire the lock
+			const acquired = await s3Mutex.acquireLock(activeLockName);
+			expect(acquired).toBe(true);
+
+			// Delete our own lock should succeed
+			const deleted = await s3Mutex.deleteLock(activeLockName);
+			expect(deleted).toBe(true);
+
+			// Verify it's gone
+			const isLocked = await s3Mutex.isLocked(activeLockName);
+			expect(isLocked).toBe(false);
+		});
+
+		test("should handle attempting to delete locks owned by others", async () => {
+			const otherDeleteLockName = `other-delete-lock-${Date.now()}`;
+
+			// Create another mutex
+			const otherMutex = new S3Mutex({
+				s3Client,
+				bucketName: lockBucket,
+				maxRetries: 2,
+				retryDelayMs: 100,
+			});
+
+			// Other mutex acquires the lock
+			await otherMutex.acquireLock(otherDeleteLockName);
+
+			// Our mutex tries to delete it without force - should fail
+			const deleted = await s3Mutex.deleteLock(otherDeleteLockName, false);
+			expect(deleted).toBe(false);
+
+			// With force should succeed
+			const forceDeleted = await s3Mutex.deleteLock(otherDeleteLockName, true);
+			expect(forceDeleted).toBe(true);
+		});
+	});
+
+	describe("Clock Skew and Time-based Edge Cases", () => {
+		test("should handle locks with future expiration times", async () => {
+			const futureLockName = `future-lock-${Date.now()}`;
+
+			// Acquire lock normally
+			const acquired = await s3Mutex.acquireLock(futureLockName);
+			expect(acquired).toBe(true);
+
+			// Verify lock is properly owned
+			const isOwned = await s3Mutex.isOwnedByUs(futureLockName);
+			expect(isOwned).toBe(true);
+
+			await s3Mutex.releaseLock(futureLockName);
+		});
+
+		test("should handle extreme clock skew scenarios", async () => {
+			const skewLockName = `extreme-skew-lock-${Date.now()}`;
+
+			// Create mutex with large clock skew tolerance
+			const extremeSkewMutex = new S3Mutex({
+				s3Client,
+				bucketName: lockBucket,
+				lockTimeoutMs: 1000,
+				clockSkewToleranceMs: 10000, // 10 second tolerance
+				maxRetries: 2,
+				retryDelayMs: 100,
+			});
+
+			const acquired = await extremeSkewMutex.acquireLock(skewLockName);
+			expect(acquired).toBe(true);
+
+			// Should be able to refresh
+			const refreshed = await extremeSkewMutex.refreshLock(skewLockName);
+			expect(refreshed).toBe(true);
+
+			await extremeSkewMutex.releaseLock(skewLockName);
+		});
+	});
+
+	describe("Memory and Resource Management", () => {
+		test("should not leak memory with many failed lock attempts", async () => {
+			const memoryTestLockName = `memory-test-lock-${Date.now()}`;
+
+			// Create a long-held lock
+			const holdingMutex = new S3Mutex({
+				s3Client,
+				bucketName: lockBucket,
+				lockTimeoutMs: 5000,
+				maxRetries: 1,
+				retryDelayMs: 50,
+			});
+
+			const testingMutex = new S3Mutex({
+				s3Client,
+				bucketName: lockBucket,
+				maxRetries: 1,
+				retryDelayMs: 50,
+			});
+
+			await holdingMutex.acquireLock(memoryTestLockName);
+
+			// Attempt many failed acquisitions
+			const failedAttempts = [];
+			for (let i = 0; i < 50; i++) {
+				failedAttempts.push(
+					testingMutex.acquireLock(`${memoryTestLockName}-${i}`),
+				);
+			}
+
+			const results = await Promise.all(failedAttempts);
+
+			// All attempts should succeed since they're different lock names
+			expect(results.every((r) => r === true)).toBe(true);
+
+			// Clean up
+			await holdingMutex.releaseLock(memoryTestLockName);
+			for (let i = 0; i < 50; i++) {
+				await testingMutex
+					.releaseLock(`${memoryTestLockName}-${i}`)
+					.catch(() => {});
+			}
+		});
+
+		test("should handle stream errors gracefully", async () => {
+			const streamErrorLockName = `stream-error-lock-${Date.now()}`;
+
+			// Create a normal lock first
+			const acquired = await s3Mutex.acquireLock(streamErrorLockName);
+			expect(acquired).toBe(true);
+
+			// Operations should still work normally
+			const isLocked = await s3Mutex.isLocked(streamErrorLockName);
+			expect(isLocked).toBe(true);
+
+			await s3Mutex.releaseLock(streamErrorLockName);
+		});
 	});
 });

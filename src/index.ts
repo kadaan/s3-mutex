@@ -1,7 +1,9 @@
 // src/index.ts
 import {
+	CreateBucketCommand,
 	DeleteObjectCommand,
 	GetObjectCommand,
+	HeadBucketCommand,
 	HeadObjectCommand,
 	ListObjectsV2Command,
 	PutObjectCommand,
@@ -52,12 +54,24 @@ export async function streamToString(
 	// Handle Node.js Readable stream
 	return new Promise((resolve, reject) => {
 		const chunks: Buffer[] = [];
+		const readableStream = stream as Readable;
 
-		(stream as Readable).on("data", (chunk) => chunks.push(Buffer.from(chunk)));
-		(stream as Readable).on("error", (err) => reject(err));
-		(stream as Readable).on("end", () =>
-			resolve(Buffer.concat(chunks).toString("utf8")),
-		);
+		const cleanup = () => {
+			readableStream.removeAllListeners();
+			if (typeof readableStream.destroy === "function") {
+				readableStream.destroy();
+			}
+		};
+
+		readableStream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+		readableStream.on("error", (err) => {
+			cleanup();
+			reject(err);
+		});
+		readableStream.on("end", () => {
+			cleanup();
+			resolve(Buffer.concat(chunks).toString("utf8"));
+		});
 	});
 }
 
@@ -73,6 +87,12 @@ export interface S3MutexOptions {
 	 * S3 bucket name where locks will be stored
 	 */
 	bucketName: string;
+
+	/**
+	 * Whether to create the bucket if it doesn't exist
+	 * @default false
+	 */
+	createBucketIfNotExists?: boolean;
 
 	/**
 	 * Key prefix for lock files (optional)
@@ -145,6 +165,8 @@ export class S3Mutex {
 	private lockTimeoutMs: number;
 	private clockSkewToleranceMs: number;
 	private ownerId: string;
+	private createBucketIfNotExists: boolean;
+	private bucketInitialized = false;
 	private heldLocks: Map<string, string> = new Map(); // lockName -> etag
 	private lockRequests: Map<string, LockRequest> = new Map(); // lockName -> request info
 	// Track lock dependencies for deadlock detection - key: owner, value: set of lock names owner is waiting for
@@ -165,7 +187,83 @@ export class S3Mutex {
 		this.useJitter = options.useJitter !== undefined ? options.useJitter : true;
 		this.lockTimeoutMs = options.lockTimeoutMs || 60000; // 1 minute default
 		this.clockSkewToleranceMs = options.clockSkewToleranceMs || 1000; // 1 second default
+		this.createBucketIfNotExists = options.createBucketIfNotExists ?? false;
 		this.ownerId = `${process.pid}-${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
+	}
+
+	/**
+	 * Ensures the S3 bucket exists, creating it if necessary and configured to do so
+	 */
+	private async ensureBucketExists(): Promise<void> {
+		if (this.bucketInitialized) {
+			return;
+		}
+
+		try {
+			// Check if the bucket exists
+			await this.s3Client.send(
+				new HeadBucketCommand({
+					Bucket: this.bucketName,
+				}),
+			);
+
+			this.bucketInitialized = true;
+			return;
+		} catch (error) {
+			const err = error as {
+				$metadata?: { httpStatusCode?: number };
+				name?: string;
+			};
+
+			// If bucket doesn't exist and we're configured to create it
+			if (
+				(err.$metadata?.httpStatusCode === 404 ||
+					err.name === "NoSuchBucket") &&
+				this.createBucketIfNotExists
+			) {
+				try {
+					await this.s3Client.send(
+						new CreateBucketCommand({
+							Bucket: this.bucketName,
+						}),
+					);
+
+					this.bucketInitialized = true;
+					return;
+				} catch (createError) {
+					const createErr = createError as {
+						$metadata?: { httpStatusCode?: number };
+						name?: string;
+					};
+
+					// If the bucket was already created by someone else, that's fine
+					if (
+						createErr.$metadata?.httpStatusCode === 409 ||
+						createErr.name === "BucketAlreadyExists"
+					) {
+						this.bucketInitialized = true;
+						return;
+					}
+
+					throw new Error(
+						`Failed to create bucket ${this.bucketName}: ${(createError as Error).message}`,
+					);
+				}
+			} else if (
+				err.$metadata?.httpStatusCode === 404 ||
+				err.name === "NoSuchBucket"
+			) {
+				// Bucket doesn't exist but we're not configured to create it
+				throw new Error(
+					`Bucket ${this.bucketName} does not exist. Set createBucketIfNotExists to true to create it automatically.`,
+				);
+			}
+
+			// Re-throw other errors (access denied, etc.)
+			throw new Error(
+				`Failed to access bucket ${this.bucketName}: ${(error as Error).message}`,
+			);
+		}
 	}
 
 	/**
@@ -471,20 +569,10 @@ export class S3Mutex {
 			// Check each lock the owner is waiting for
 			for (const waitLockName of waitingFor) {
 				// If the owner is waiting for a lock we hold, we have a cycle
+				// Simply check our local heldLocks map instead of making S3 calls
 				if (this.heldLocks.has(waitLockName)) {
-					// Get the lock info to verify we own it
-					try {
-						const isOwnedByUs = await this.isOwnedByUs(waitLockName);
-						if (isOwnedByUs) {
-							// We've detected a deadlock cycle
-							return true;
-						}
-					} catch (error) {
-						// If there's an error checking ownership, be conservative and assume no deadlock
-						console.warn(
-							`Error checking ownership for deadlock detection: ${error}`,
-						);
-					}
+					// We've detected a deadlock cycle
+					return true;
 				}
 
 				// Find out who owns this lock and add them to the queue
@@ -518,6 +606,9 @@ export class S3Mutex {
 		priority = 0,
 	): Promise<boolean> {
 		try {
+			// Ensure the bucket exists before proceeding
+			await this.ensureBucketExists();
+
 			// Register this lock request for deadlock detection
 			this.lockRequests.set(lockName, {
 				lockName,
@@ -535,8 +626,6 @@ export class S3Mutex {
 			for (let attempt = 0; attempt < this.maxRetries; attempt++) {
 				// Check if we've exceeded the overall timeout
 				if (Date.now() - startTime > maxWaitTime) {
-					this.lockRequests.delete(lockName);
-					this.lockDependencies.delete(this.ownerId);
 					return false;
 				}
 
@@ -563,7 +652,7 @@ export class S3Mutex {
 					const isLockFree =
 						!lockInfo.locked ||
 						(lockInfo.expiresAt !== undefined &&
-							lockInfo.expiresAt < now - this.clockSkewToleranceMs);
+							lockInfo.expiresAt + this.clockSkewToleranceMs < now);
 
 					// If the lock is held but the current request has higher priority,
 					// we'll try to force-acquire it if we detect a potential deadlock
@@ -636,23 +725,26 @@ export class S3Mutex {
 				}
 			}
 
-			this.lockRequests.delete(lockName);
-			// Clean up dependencies as we failed to acquire the lock
-			const ourDependencies = this.lockDependencies.get(this.ownerId);
-			if (ourDependencies) {
-				ourDependencies.delete(lockName);
-				if (ourDependencies.size === 0) {
-					this.lockDependencies.delete(this.ownerId);
-				}
-			}
 			return false;
 		} catch (error) {
 			// Handle critical errors that prevent lock acquisition
-			this.lockRequests.delete(lockName);
-			// Clean up dependencies
-			this.lockDependencies.delete(this.ownerId);
 			console.error(`Critical error acquiring lock ${lockName}:`, error);
 			return false;
+		} finally {
+			// Always clean up lock requests and dependencies if lock acquisition failed
+			// This prevents memory leaks from accumulating failed lock attempts
+			if (!this.heldLocks.has(lockName)) {
+				this.lockRequests.delete(lockName);
+
+				// Clean up dependencies more carefully - only remove this specific lock dependency
+				const ourDependencies = this.lockDependencies.get(this.ownerId);
+				if (ourDependencies) {
+					ourDependencies.delete(lockName);
+					if (ourDependencies.size === 0) {
+						this.lockDependencies.delete(this.ownerId);
+					}
+				}
+			}
 		}
 	}
 
@@ -773,25 +865,23 @@ export class S3Mutex {
 			const acquired = await this.acquireLock(lockName, acquireTimeout);
 
 			if (acquired) {
-				// Setup for heartbeat
-				let heartbeatStopped = true; // Start as true to prevent any early heartbeats
+				// Setup for heartbeat with atomic cleanup function
 				let heartbeatInterval: NodeJS.Timeout | null = null;
 
+				const stopHeartbeat = () => {
+					if (heartbeatInterval) {
+						clearInterval(heartbeatInterval);
+						heartbeatInterval = null;
+					}
+				};
+
 				try {
-					// Set up a timer to refresh the lock periodically, but only after we're
-					// ready to execute the function
+					// Set up a timer to refresh the lock periodically
 					const refreshInterval = Math.max(this.lockTimeoutMs / 3, 1000);
 
-					// Now we can enable heartbeats
-					heartbeatStopped = false;
-
 					heartbeatInterval = setInterval(async () => {
-						if (heartbeatStopped) {
-							// Double check to prevent any race conditions
-							if (heartbeatInterval) {
-								clearInterval(heartbeatInterval);
-								heartbeatInterval = null;
-							}
+						// Check if interval is still valid (prevents race conditions)
+						if (!heartbeatInterval) {
 							return;
 						}
 
@@ -802,32 +892,20 @@ export class S3Mutex {
 								console.warn(
 									`Failed to refresh lock ${lockName}, stopping heartbeat`,
 								);
-								heartbeatStopped = true;
-								if (heartbeatInterval) {
-									clearInterval(heartbeatInterval);
-									heartbeatInterval = null;
-								}
+								stopHeartbeat();
 							}
 						} catch (error) {
 							console.warn(`Error refreshing lock ${lockName}: ${error}`);
 							// Also stop on errors
-							heartbeatStopped = true;
-							if (heartbeatInterval) {
-								clearInterval(heartbeatInterval);
-								heartbeatInterval = null;
-							}
+							stopHeartbeat();
 						}
 					}, refreshInterval);
 
 					// Execute the function
 					const result = await fn();
 
-					// Ensure heartbeat is stopped before returning
-					heartbeatStopped = true;
-					if (heartbeatInterval) {
-						clearInterval(heartbeatInterval);
-						heartbeatInterval = null;
-					}
+					// Stop heartbeat before returning
+					stopHeartbeat();
 
 					// Return the result
 					return result;
@@ -838,43 +916,32 @@ export class S3Mutex {
 						error,
 					);
 
-					// Ensure the lock is released and then rethrow
-					if (heartbeatInterval) {
-						heartbeatStopped = true;
-						clearInterval(heartbeatInterval);
-					}
+					// Stop heartbeat immediately
+					stopHeartbeat();
 
-					// Make a determined effort to release the lock - retry on failure
-					let released = false;
-					for (let attempt = 0; attempt < 3 && !released; attempt++) {
+					// Try to release the lock with timeout to prevent hanging
+					const releaseWithTimeout = async (timeoutMs = 5000) => {
+						const releasePromise = this.releaseLock(lockName);
+						const timeoutPromise = new Promise((_, reject) =>
+							setTimeout(() => reject(new Error("Release timeout")), timeoutMs),
+						);
+
 						try {
-							released = await this.releaseLock(lockName);
-							if (!released) {
-								// Wait a bit before retrying
-								await new Promise((resolve) =>
-									setTimeout(resolve, 100 * (attempt + 1)),
-								);
-							}
+							await Promise.race([releasePromise, timeoutPromise]);
 						} catch (releaseError) {
 							console.warn(
-								`Failed to release lock ${lockName} (attempt ${attempt + 1}): ${releaseError}`,
+								`Failed to release lock ${lockName}: ${releaseError}`,
 							);
-							if (attempt < 2) {
-								await new Promise((resolve) =>
-									setTimeout(resolve, 100 * (attempt + 1)),
-								);
-							}
 						}
-					}
+					};
+
+					await releaseWithTimeout();
 
 					// Rethrow the original error
 					throw error;
 				} finally {
 					// Clean up heartbeat
-					if (heartbeatInterval) {
-						heartbeatStopped = true;
-						clearInterval(heartbeatInterval);
-					}
+					stopHeartbeat();
 
 					// Release the lock (this is also done in the catch block but we need it here for normal exit)
 					try {
@@ -1010,6 +1077,9 @@ export class S3Mutex {
 			dryRun?: boolean;
 		} = {},
 	): Promise<{ cleaned: number; total: number; stale: number }> {
+		// Ensure the bucket exists before proceeding
+		await this.ensureBucketExists();
+
 		const prefix = options.prefix || this.keyPrefix;
 		const olderThan = options.olderThan || Date.now() - this.lockTimeoutMs;
 		const dryRun = options.dryRun;
@@ -1060,11 +1130,13 @@ export class S3Mutex {
 						const body = await streamToString(objResponse.Body);
 						const lockInfo = JSON.parse(body) as LockInfo;
 
-						// Check if the lock is stale
+						// Check if the lock is stale based on either acquisition time OR expiration
+						const now = Date.now();
 						const isStale =
 							lockInfo.locked &&
-							lockInfo.acquiredAt !== undefined &&
-							lockInfo.acquiredAt < olderThan;
+							((lockInfo.acquiredAt !== undefined &&
+								lockInfo.acquiredAt < olderThan) ||
+								(lockInfo.expiresAt !== undefined && lockInfo.expiresAt < now));
 
 						if (isStale) {
 							stale++;

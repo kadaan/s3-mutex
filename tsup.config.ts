@@ -69,8 +69,6 @@ export default defineConfig({
 	async onSuccess() {
 		// If you want need to add a use statement to files, you can use the following code:
 		// await _addUseStatement('dist/react', 'client');
-
-		await linkSelf();
 	},
 	...common,
 });

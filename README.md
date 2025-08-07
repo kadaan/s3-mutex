@@ -5,6 +5,7 @@ A distributed locking mechanism for Node.js applications using AWS S3 as the bac
 ## Features
 
 - **Distributed locking**: Coordinate access across multiple services
+- **Automatic bucket creation**: Optionally create S3 buckets if they don't exist
 - **Deadlock detection**: Priority-based mechanism for deadlock resolution
 - **Timeout handling**: Automatic lock expiration with configurable timeouts
 - **Lock heartbeat**: Automatic lock refresh during long operations
@@ -32,19 +33,36 @@ pnpm add s3-mutex
 import { S3Client } from "@aws-sdk/client-s3";
 import { S3Mutex } from "s3-mutex";
 
-// Initialize S3 client
+// Option 1: Initialize with existing S3 client
 const s3Client = new S3Client({
   region: "us-east-1",
   // other configuration options
 });
 
-// make sure your bucket exists first...
-
-// Create mutex instance
 const mutex = new S3Mutex({
   s3Client,
   bucketName: "my-locks-bucket",
   keyPrefix: "locks/", // optional, defaults to "locks/"
+});
+
+// Option 2: Let S3Mutex create the S3 client
+const mutex2 = new S3Mutex({
+  bucketName: "my-locks-bucket",
+  s3ClientConfig: {
+    region: "us-east-1",
+    forcePathStyle: true, // useful for MinIO/LocalStack
+    // other S3ClientConfig options
+  },
+});
+
+// Option 3: Automatically create bucket if it doesn't exist
+const mutex3 = new S3Mutex({
+  bucketName: "my-locks-bucket",
+  createBucketIfNotExists: true, // Create bucket automatically
+  s3ClientConfig: {
+    region: "us-east-1",
+    // other S3ClientConfig options
+  },
 });
 
 // Acquire a lock
@@ -87,14 +105,28 @@ if (result === null) {
 
 ```typescript
 const mutex = new S3Mutex({
-  // Required options
-  s3Client: s3Client,
+  // Required: bucket name
   bucketName: "my-locks-bucket",
   
+  // Either provide an existing S3 client
+  s3Client: s3Client,
+  
+  // OR provide S3 client configuration (s3-mutex will create the client)
+  s3ClientConfig: {
+    region: "us-east-1",
+    forcePathStyle: true,       // Useful for MinIO/LocalStack
+    endpoint: "http://localhost:9000", // For local development
+    credentials: {
+      accessKeyId: "your-key",
+      secretAccessKey: "your-secret"
+    }
+  },
+  
   // Optional configuration with defaults
+  createBucketIfNotExists: false,  // Create bucket if it doesn't exist
   keyPrefix: "locks/",          // Prefix for lock keys in S3
   maxRetries: 5,                // Max number of acquisition attempts
-  retryDelayMs: 200,            // Base delay between retries
+  retryDelayMs: 200,            // Base delay between retries (exponential backoff)
   maxRetryDelayMs: 5000,        // Max delay between retries
   useJitter: true,              // Add randomness to retry delays
   lockTimeoutMs: 60000,         // Lock expiration (1 minute)
@@ -112,22 +144,77 @@ new S3Mutex(options: S3MutexOptions)
 
 ### Methods
 
-- **acquireLock(lockName, timeoutMs?, priority?)**: Acquire a named lock with optional timeout and priority
-- **releaseLock(lockName, force?)**: Release a lock, with optional force parameter
-- **refreshLock(lockName)**: Refresh a lock's expiration time
-- **isLocked(lockName)**: Check if a lock is currently held
-- **isOwnedByUs(lockName)**: Check if we own a specific lock
-- **deleteLock(lockName, force?)**: Completely remove a lock file
-- **withLock(lockName, fn, options?)**: Execute a function with an automatic lock
-- **cleanupStaleLocks(options?)**: Find and clean up expired locks
+- **acquireLock(lockName: string, timeoutMs?: number, priority?: number): Promise<boolean>**: Acquire a named lock with optional timeout and priority
+- **releaseLock(lockName: string, force?: boolean): Promise<boolean>**: Release a lock, with optional force parameter
+- **refreshLock(lockName: string): Promise<boolean>**: Refresh a lock's expiration time
+- **isLocked(lockName: string): Promise<boolean>**: Check if a lock is currently held and not expired
+- **isOwnedByUs(lockName: string): Promise<boolean>**: Check if we own a specific lock
+- **deleteLock(lockName: string, force?: boolean): Promise<boolean>**: Completely remove a lock file from S3
+- **withLock<T>(lockName: string, fn: () => Promise<T>, options?: {timeoutMs?: number, retries?: number}): Promise<T | null>**: Execute a function with an automatic lock
+- **cleanupStaleLocks(options?: {prefix?: string, olderThan?: number, dryRun?: boolean}): Promise<{cleaned: number, total: number, stale: number}>**: Find and clean up expired locks
 
 ### Lock Priority and Deadlock Prevention
 
 S3-Mutex includes deadlock prevention through priority-based acquisition. When multiple processes attempt to acquire locks, those with higher priority values will be favored if deadlock conditions are detected.
 
 ```typescript
-// Acquire with priority (higher value = higher priority)
-await mutex.acquireLock("resource-lock", undefined, 10);
+// Basic priority usage (higher value = higher priority)
+const acquired = await mutex.acquireLock("resource-lock", undefined, 10);
+
+// Example: High-priority background job
+const backgroundJobLock = await mutex.acquireLock(
+  "critical-maintenance",
+  30000, // 30 second timeout
+  100    // High priority
+);
+
+// Example: Low-priority routine task
+const routineLock = await mutex.acquireLock(
+  "routine-cleanup",
+  10000, // 10 second timeout
+  1      // Low priority
+);
+```
+
+**How Priority Works:**
+- When a deadlock is potentially detected, higher priority requests can force-acquire locks
+- Priority only matters during deadlock resolution, not normal acquisition
+- Use priorities strategically: critical operations get higher values, routine tasks get lower values
+
+## Bucket Management
+
+### Automatic Bucket Creation
+
+S3-Mutex can automatically create the S3 bucket if it doesn't exist. This is particularly useful for development environments or when deploying to new AWS accounts.
+
+```typescript
+const mutex = new S3Mutex({
+  bucketName: "my-locks-bucket",
+  createBucketIfNotExists: true, // Enable automatic bucket creation
+  s3ClientConfig: {
+    region: "us-east-1",
+  },
+});
+
+// The bucket will be created automatically on first use
+const acquired = await mutex.acquireLock("my-resource-lock");
+```
+
+**Important Notes:**
+- Bucket creation requires appropriate IAM permissions (`s3:CreateBucket`)
+- If the bucket already exists, no error is thrown
+- The bucket is created with default settings (no versioning, no lifecycle policies)
+- For production use, consider creating buckets manually with proper configuration
+
+### Manual Bucket Creation
+
+For production environments, it's recommended to create buckets manually:
+
+```bash
+# Using AWS CLI
+aws s3 mb s3://my-locks-bucket --region us-east-1
+
+# Or using CloudFormation/Terraform for infrastructure as code
 ```
 
 ## Advanced Usage
@@ -144,6 +231,14 @@ const results = await mutex.cleanupStaleLocks({
 
 console.log(`Found ${results.stale} stale locks out of ${results.total} total locks`);
 console.log(`Cleaned up ${results.cleaned} locks`);
+
+// Cleanup all stale locks with default settings
+const quickCleanup = await mutex.cleanupStaleLocks();
+
+// Cleanup locks older than 2 hours
+const oldLockCleanup = await mutex.cleanupStaleLocks({
+  olderThan: Date.now() - (2 * 60 * 60 * 1000)
+});
 ```
 
 ### Force-releasing a Lock
@@ -151,6 +246,16 @@ console.log(`Cleaned up ${results.cleaned} locks`);
 ```typescript
 // Force release a lock (use with caution)
 await mutex.releaseLock("resource-lock", true);
+
+// Force delete a lock file completely
+await mutex.deleteLock("resource-lock", true);
+
+// Check lock ownership before operations
+if (await mutex.isOwnedByUs("resource-lock")) {
+  await mutex.refreshLock("resource-lock");
+  // do work
+  await mutex.releaseLock("resource-lock");
+}
 ```
 
 ## Best Practices
@@ -164,4 +269,102 @@ await mutex.releaseLock("resource-lock", true);
 7. **Test thoroughly under load**: Verify lock reliability under your specific workload conditions
 8. **Have a fallback strategy**: Plan for occasional lock failures in production environments
 9. **Monitor lock contention**: High contention may indicate need for architectural changes
+10. **Use appropriate priorities**: Reserve high priorities for critical operations, use low priorities for routine tasks
+11. **Handle null returns from withLock**: The `withLock` method returns `null` if lock acquisition fails
+12. **Consider clock skew**: Set `clockSkewToleranceMs` appropriately for your distributed environment
+
+## Development and Testing
+
+### Prerequisites
+
+- Node.js 18+
+- Docker (for running S3-compatible storage locally)
+
+### Local Development Setup
+
+1. **Start MinIO (S3-compatible storage) for testing:**
+
+```bash
+# Using Docker Compose (if available in the project)
+docker-compose up -d
+
+# Or run MinIO directly
+docker run -d \
+  --name minio \
+  -p 9000:9000 \
+  -p 9001:9001 \
+  -e MINIO_ROOT_USER=root \
+  -e MINIO_ROOT_PASSWORD=password \
+  quay.io/minio/minio server /data --console-address ":9001"
+```
+
+2. **Install dependencies:**
+
+```bash
+pnpm install
+```
+
+3. **Run tests:**
+
+```bash
+# Run tests (requires MinIO running)
+pnpm test
+
+# Run tests with coverage
+pnpm test:ci
+
+# Build the project
+pnpm build
+
+# Lint code
+pnpm lint
+```
+
+### Testing with Different S3 Implementations
+
+The library is tested with:
+
+- **MinIO** (recommended for local development)
+- **LocalStack** (AWS services emulation)
+- **AWS S3** (production)
+
+#### Environment Variables for Testing
+
+```bash
+# S3 endpoint (default: http://localhost:9000)
+S3_ENDPOINT=http://localhost:9000
+
+# S3 region (default: us-east-1)
+S3_REGION=us-east-1
+
+# S3 credentials (defaults: root/password for MinIO)
+S3_ACCESS_KEY=root
+S3_SECRET_KEY=password
+```
+
+### Example Test Configuration
+
+```typescript
+import { S3Client } from "@aws-sdk/client-s3";
+import { S3Mutex } from "s3-mutex";
+
+// Test configuration for MinIO
+const testMutex = new S3Mutex({
+  bucketName: "test-locks-bucket",
+  createBucketIfNotExists: true, // Automatically create test bucket
+  s3ClientConfig: {
+    forcePathStyle: true,
+    endpoint: "http://localhost:9000",
+    region: "us-east-1",
+    credentials: {
+      accessKeyId: "root",
+      secretAccessKey: "password",
+    },
+  },
+  // Faster settings for testing
+  maxRetries: 3,
+  retryDelayMs: 100,
+  lockTimeoutMs: 1000,
+});
+```
 
