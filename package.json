@@ -39,14 +39,15 @@
 		"link:self": "pnpm link --global",
 		"prepare": "lefthook install"
 	},
-	"types": "./dist/index.d.ts",
+	"types": "./src/index.ts",
 	"exports": {
 		".": {
-			"require": "./dist/index.js",
-			"import": "./dist/index.mjs"
+			"types": "./src/index.ts",
+			"import": "./src/index.ts",
+			"require": "./src/index.ts"
 		}
 	},
-	"files": ["dist"],
+	"files": ["src", "dist"],
 	"config": {
 		"commitizen": {
 			"path": "./node_modules/@ryansonshine/cz-conventional-changelog"
