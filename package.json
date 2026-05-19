@@ -1,8 +1,9 @@
 {
-	"name": "s3-mutex",
-	"description": "A robust distributed locking mechanism for Node.js applications using AWS S3 as the backend storage, with support for deadlock detection, timeout handling, automatic lock refresh, retry with backoff, and cleanup utilities.",
+	"name": "@kadaan/s3-mutex",
+	"description": "A robust distributed locking mechanism for Node.js applications using AWS S3 as the backend storage, with support for deadlock detection, timeout handling, automatic lock refresh, retry with backoff, and cleanup utilities. Fork of s3-mutex adding injectable ownerId for cooperating instances (e.g. a heartbeat worker refreshing a lock acquired by another thread).",
 	"version": "2.0.0",
 	"author": "Tim Mikeladze <tim.mikeladze@gmail.com>",
+	"contributors": ["kadaan"],
 	"license": "MIT",
 	"keywords": [
 		"s3",
@@ -22,7 +23,7 @@
 	],
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/TimMikeladze/s3-mutex"
+		"url": "https://github.com/kadaan/s3-mutex"
 	},
 	"scripts": {
 		"dev": "concurrently \"pnpm build --watch\" \"pnpm test\" ",
@@ -103,9 +104,6 @@
 		"vitest": "3.1.2"
 	},
 	"pnpm": {
-		"overrides": {
-			"micromatch@<4.0.8": ">=4.0.8"
-		},
 		"onlyBuiltDependencies": [
 			"@biomejs/biome",
 			"@swc/core",
@@ -115,5 +113,8 @@
 	},
 	"dependencies": {
 		"@aws-sdk/client-s3": "^3.802.0"
+	},
+	"overrides": {
+		"micromatch@<4.0.8": ">=4.0.8"
 	}
 }

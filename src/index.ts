@@ -136,6 +136,17 @@ export interface S3MutexOptions {
 	 * @default 1000 (1 second)
 	 */
 	clockSkewToleranceMs?: number;
+
+	/**
+	 * Identifier written into the lock's `owner` field. When omitted, a fresh
+	 * id is generated as `${pid}-${Date.now()}-${random}`.
+	 *
+	 * Inject this when two `S3Mutex` instances need to operate on the same
+	 * lock — for example, a heartbeat worker that refreshes a lock acquired
+	 * by another thread. Both instances must be constructed with the same
+	 * `ownerId` so `refreshLock` / `releaseLock`'s ownership check passes.
+	 */
+	ownerId?: string;
 }
 
 export interface LockInfo {
@@ -188,7 +199,18 @@ export class S3Mutex {
 		this.lockTimeoutMs = options.lockTimeoutMs || 60000; // 1 minute default
 		this.clockSkewToleranceMs = options.clockSkewToleranceMs || 1000; // 1 second default
 		this.createBucketIfNotExists = options.createBucketIfNotExists ?? false;
-		this.ownerId = `${process.pid}-${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
+		this.ownerId =
+			options.ownerId ??
+			`${process.pid}-${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
+	}
+
+	/**
+	 * Returns the identifier written into the `owner` field of locks acquired
+	 * by this instance. Useful when one process needs to forward the id to a
+	 * cooperating instance (e.g. a heartbeat worker) so refreshLock matches.
+	 */
+	public getOwnerId(): string {
+		return this.ownerId;
 	}
 
 	/**

@@ -144,6 +144,56 @@ describe("S3Mutex Tests", () => {
 		await s3Mutex.releaseLock(lockName);
 	});
 
+	test("a second mutex with the same injected ownerId can refresh the lock", async () => {
+		// Use an explicit ownerId so two cooperating instances (e.g. main
+		// thread + heartbeat worker) can act on the same lock.
+		const sharedOwnerId = `shared-${Date.now()}-${Math.random()}`;
+		const ownerMutex = new S3Mutex({
+			s3Client,
+			bucketName: lockBucket,
+			maxRetries: 3,
+			retryDelayMs: 100,
+			lockTimeoutMs: 2000,
+			ownerId: sharedOwnerId,
+		});
+		const heartbeatMutex = new S3Mutex({
+			s3Client,
+			bucketName: lockBucket,
+			maxRetries: 3,
+			retryDelayMs: 100,
+			lockTimeoutMs: 2000,
+			ownerId: sharedOwnerId,
+		});
+
+		expect(ownerMutex.getOwnerId()).toBe(sharedOwnerId);
+		expect(heartbeatMutex.getOwnerId()).toBe(sharedOwnerId);
+
+		try {
+			const acquired = await ownerMutex.acquireLock(lockName);
+			expect(acquired).toBe(true);
+
+			// Without ownerId injection this would return false because the
+			// heartbeatMutex would have a freshly-generated ownerId.
+			const refreshed = await heartbeatMutex.refreshLock(lockName);
+			expect(refreshed).toBe(true);
+
+			// A third mutex with its own auto-generated ownerId must NOT be
+			// able to refresh — guards against accidentally widening ownership.
+			const strangerMutex = new S3Mutex({
+				s3Client,
+				bucketName: lockBucket,
+				maxRetries: 3,
+				retryDelayMs: 100,
+				lockTimeoutMs: 2000,
+			});
+			expect(strangerMutex.getOwnerId()).not.toBe(sharedOwnerId);
+			const stolenRefresh = await strangerMutex.refreshLock(lockName);
+			expect(stolenRefresh).toBe(false);
+		} finally {
+			await ownerMutex.releaseLock(lockName, true);
+		}
+	});
+
 	test("should execute a function with a lock and release it afterwards", async () => {
 		let executionFlag = false;
 
