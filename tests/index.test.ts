@@ -133,7 +133,7 @@ describe("S3Mutex Tests", () => {
 		expect(acquired).toBe(true);
 
 		// Refresh the lock
-		const refreshed = await s3Mutex.refreshLock(lockName);
+		const { refreshed } = await s3Mutex.refreshLock(lockName);
 		expect(refreshed).toBe(true);
 
 		// Should still own the lock after refresh
@@ -174,7 +174,7 @@ describe("S3Mutex Tests", () => {
 
 			// Without ownerId injection this would return false because the
 			// heartbeatMutex would have a freshly-generated ownerId.
-			const refreshed = await heartbeatMutex.refreshLock(lockName);
+			const { refreshed } = await heartbeatMutex.refreshLock(lockName);
 			expect(refreshed).toBe(true);
 
 			// A third mutex with its own auto-generated ownerId must NOT be
@@ -188,7 +188,8 @@ describe("S3Mutex Tests", () => {
 			});
 			expect(strangerMutex.getOwnerId()).not.toBe(sharedOwnerId);
 			const stolenRefresh = await strangerMutex.refreshLock(lockName);
-			expect(stolenRefresh).toBe(false);
+			expect(stolenRefresh.refreshed).toBe(false);
+			expect(stolenRefresh.reason).toBe("not-owner");
 		} finally {
 			await ownerMutex.releaseLock(lockName, true);
 		}
@@ -358,7 +359,8 @@ describe("S3Mutex Tests", () => {
 
 		// Try to refresh the lock - should fail because it's expired
 		const refreshed = await shortTimeoutMutex.refreshLock(testLockName);
-		expect(refreshed).toBe(false);
+		expect(refreshed.refreshed).toBe(false);
+		expect(refreshed.reason).toBe("expired");
 
 		// Clean up
 		await shortTimeoutMutex.deleteLock(testLockName, true);
@@ -853,7 +855,8 @@ describe("S3Mutex Tests", () => {
 			const nonExistentLockName = `non-existent-refresh-lock-${Date.now()}`;
 
 			const refreshed = await s3Mutex.refreshLock(nonExistentLockName);
-			expect(refreshed).toBe(false);
+			expect(refreshed.refreshed).toBe(false);
+			expect(refreshed.reason).toBe("not-found");
 		});
 
 		test("should handle refreshing locks owned by others", async () => {
@@ -872,7 +875,8 @@ describe("S3Mutex Tests", () => {
 
 			// Our mutex tries to refresh it - should fail
 			const refreshed = await s3Mutex.refreshLock(otherOwnerLockName);
-			expect(refreshed).toBe(false);
+			expect(refreshed.refreshed).toBe(false);
+			expect(refreshed.reason).toBe("not-owner");
 
 			// Clean up
 			await otherMutex.releaseLock(otherOwnerLockName);
@@ -992,7 +996,7 @@ describe("S3Mutex Tests", () => {
 			expect(acquired).toBe(true);
 
 			// Should be able to refresh
-			const refreshed = await extremeSkewMutex.refreshLock(skewLockName);
+			const { refreshed } = await extremeSkewMutex.refreshLock(skewLockName);
 			expect(refreshed).toBe(true);
 
 			await extremeSkewMutex.releaseLock(skewLockName);

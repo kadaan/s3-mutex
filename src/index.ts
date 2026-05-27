@@ -157,6 +157,30 @@ export interface LockInfo {
 	priority?: number;
 }
 
+/** Why a {@link S3Mutex.refreshLock} call did not refresh the lock. */
+export type RefreshFailureReason =
+	| "not-locked" // lock.json reports locked=false (released)
+	| "not-owner" // lock is held by a different owner (taken over)
+	| "expired" // the lock's expiresAt is in the past
+	| "etag-conflict" // a concurrent write changed lock.json (IfMatch 412)
+	| "not-found" // lock.json does not exist (404)
+	| "s3-error"; // an S3/network error prevented the refresh
+
+/**
+ * Outcome of a {@link S3Mutex.refreshLock} call. On failure, `reason` names the
+ * cause so callers (e.g. a heartbeat) can log or react precisely instead of
+ * seeing a bare `false`. `currentOwner`/`expiresAt` reflect lock.json at the
+ * time of the check when it was readable; `error` carries the raw cause for
+ * `s3-error`/`not-found`.
+ */
+export interface RefreshResult {
+	refreshed: boolean;
+	reason?: RefreshFailureReason;
+	currentOwner?: string;
+	expiresAt?: number;
+	error?: unknown;
+}
+
 // Used for deadlock prevention
 interface LockRequest {
 	lockName: string;
@@ -771,47 +795,65 @@ export class S3Mutex {
 	}
 
 	/**
-	 * Refreshes a lock's expiration time
+	 * Refreshes a lock's expiration time.
 	 * @param lockName Name of the lock to refresh
-	 * @returns A promise that resolves to true if the lock was refreshed, false otherwise
+	 * @returns A {@link RefreshResult} — `refreshed` is true on success; on
+	 *   failure `reason` names the cause (and `currentOwner`/`error` give context)
+	 *   so callers can diagnose instead of seeing a bare false.
 	 */
-	public async refreshLock(lockName: string): Promise<boolean> {
+	public async refreshLock(lockName: string): Promise<RefreshResult> {
+		let lockInfo: LockInfo;
+		let etag: string;
 		try {
-			// Get the current lock info
-			const { lockInfo, etag } = await this.getLockInfo(lockName);
+			({ lockInfo, etag } = await this.getLockInfo(lockName));
+		} catch (error) {
+			const code = (error as { $metadata?: { httpStatusCode?: number } })
+				.$metadata?.httpStatusCode;
+			return {
+				refreshed: false,
+				reason: code === 404 ? "not-found" : "s3-error",
+				error,
+			};
+		}
 
-			// Check if the lock is held by us
-			const now = Date.now();
+		const now = Date.now();
+		if (!lockInfo.locked) {
+			return {
+				refreshed: false,
+				reason: "not-locked",
+				currentOwner: lockInfo.owner,
+			};
+		}
+		if (lockInfo.owner !== this.ownerId) {
+			return {
+				refreshed: false,
+				reason: "not-owner",
+				currentOwner: lockInfo.owner,
+			};
+		}
+		if (lockInfo.expiresAt !== undefined && lockInfo.expiresAt < now) {
+			return {
+				refreshed: false,
+				reason: "expired",
+				currentOwner: lockInfo.owner,
+				expiresAt: lockInfo.expiresAt,
+			};
+		}
 
-			// Check if the lock is held by us AND not expired
-			if (
-				!lockInfo.locked ||
-				lockInfo.owner !== this.ownerId ||
-				(lockInfo.expiresAt !== undefined && lockInfo.expiresAt < now)
-			) {
-				return false;
-			}
-
-			// Update the expiration time
-			lockInfo.expiresAt = now + this.lockTimeoutMs;
-
+		// Extend the expiration time.
+		lockInfo.expiresAt = now + this.lockTimeoutMs;
+		try {
 			const newEtag = await this.updateLockInfo(lockName, lockInfo, etag);
-
-			return !!newEtag;
-			// biome-ignore lint/suspicious/noExplicitAny: <explanation>
-		} catch (error: any) {
-			// Enhanced error handling
-			if (error.$metadata?.httpStatusCode === 404) {
-				console.warn(`Lock file ${lockName} not found during refresh`);
-			} else if (error.$metadata?.httpStatusCode === 503) {
-				console.warn(
-					`S3 service unavailable while refreshing lock ${lockName}`,
-				);
-			} else {
-				console.warn(`Error refreshing lock ${lockName}: ${error.message}`);
+			if (!newEtag) {
+				return {
+					refreshed: false,
+					reason: "etag-conflict",
+					currentOwner: lockInfo.owner,
+				};
 			}
-
-			return false;
+			return { refreshed: true };
+		} catch (error) {
+			return { refreshed: false, reason: "s3-error", error };
 		}
 	}
 
@@ -908,11 +950,11 @@ export class S3Mutex {
 						}
 
 						try {
-							const refreshed = await this.refreshLock(lockName);
+							const { refreshed, reason } = await this.refreshLock(lockName);
 							// If refresh fails, stop the heartbeat to prevent further attempts
 							if (!refreshed) {
 								console.warn(
-									`Failed to refresh lock ${lockName}, stopping heartbeat`,
+									`Failed to refresh lock ${lockName} (${reason}), stopping heartbeat`,
 								);
 								stopHeartbeat();
 							}
