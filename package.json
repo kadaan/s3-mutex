@@ -1,7 +1,7 @@
 {
 	"name": "@kadaan/s3-mutex",
 	"description": "A robust distributed locking mechanism for Node.js applications using AWS S3 as the backend storage, with support for deadlock detection, timeout handling, automatic lock refresh, retry with backoff, and cleanup utilities. Fork of s3-mutex adding injectable ownerId for cooperating instances (e.g. a heartbeat worker refreshing a lock acquired by another thread).",
-	"version": "2.2.0",
+	"version": "2.3.0",
 	"author": "Tim Mikeladze <tim.mikeladze@gmail.com>",
 	"contributors": ["kadaan"],
 	"license": "MIT",

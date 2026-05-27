@@ -147,6 +147,13 @@ export interface S3MutexOptions {
 	 * `ownerId` so `refreshLock` / `releaseLock`'s ownership check passes.
 	 */
 	ownerId?: string;
+
+	/**
+	 * Sink for the library's internal warnings. When provided, it replaces the
+	 * default `console.warn`, so a host whose console is not observable (e.g. a
+	 * heartbeat worker thread) can route these messages into its own logger.
+	 */
+	logger?: (level: "warn", message: string) => void;
 }
 
 export interface LockInfo {
@@ -200,6 +207,7 @@ export class S3Mutex {
 	private lockTimeoutMs: number;
 	private clockSkewToleranceMs: number;
 	private ownerId: string;
+	private logger?: (level: "warn", message: string) => void;
 	private createBucketIfNotExists: boolean;
 	private bucketInitialized = false;
 	private heldLocks: Map<string, string> = new Map(); // lockName -> etag
@@ -226,6 +234,16 @@ export class S3Mutex {
 		this.ownerId =
 			options.ownerId ??
 			`${process.pid}-${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
+		this.logger = options.logger;
+	}
+
+	/** Routes an internal warning to the configured logger, or `console.warn`. */
+	private warn(message: string): void {
+		if (this.logger) {
+			this.logger("warn", message);
+		} else {
+			console.warn(message);
+		}
 	}
 
 	/**
@@ -629,7 +647,7 @@ export class S3Mutex {
 					}
 				} catch (error) {
 					// If we can't get lock info, continue with the next lock
-					console.warn(
+					this.warn(
 						`Error getting lock info for deadlock detection: ${error}`,
 					);
 				}
@@ -750,18 +768,18 @@ export class S3Mutex {
 						message: string;
 					};
 					if (err.$metadata?.httpStatusCode === 503) {
-						console.warn(
+						this.warn(
 							`S3 service unavailable while acquiring lock ${lockName}. Retrying...`,
 						);
 					} else if (err.name === "ThrottlingException") {
-						console.warn(
+						this.warn(
 							`AWS request throttling encountered while acquiring lock ${lockName}. Retrying...`,
 						);
 					} else if (err.$metadata?.httpStatusCode === 404) {
 						// Lock file disappeared, try to initialize it again
 						await this.initializeLock(lockName);
 					} else {
-						console.warn(
+						this.warn(
 							`Error acquiring lock ${lockName}: ${err.message}. Retrying...`,
 						);
 					}
@@ -898,11 +916,11 @@ export class S3Mutex {
 		} catch (error: any) {
 			// Enhanced error handling
 			if (error.$metadata?.httpStatusCode === 404) {
-				console.warn(`Lock file ${lockName} not found during release`);
+				this.warn(`Lock file ${lockName} not found during release`);
 			} else if (error.$metadata?.httpStatusCode === 503) {
-				console.warn(`S3 service unavailable while releasing lock ${lockName}`);
+				this.warn(`S3 service unavailable while releasing lock ${lockName}`);
 			} else {
-				console.warn(`Error releasing lock ${lockName}: ${error.message}`);
+				this.warn(`Error releasing lock ${lockName}: ${error.message}`);
 			}
 
 			return false;
@@ -953,13 +971,13 @@ export class S3Mutex {
 							const { refreshed, reason } = await this.refreshLock(lockName);
 							// If refresh fails, stop the heartbeat to prevent further attempts
 							if (!refreshed) {
-								console.warn(
+								this.warn(
 									`Failed to refresh lock ${lockName} (${reason}), stopping heartbeat`,
 								);
 								stopHeartbeat();
 							}
 						} catch (error) {
-							console.warn(`Error refreshing lock ${lockName}: ${error}`);
+							this.warn(`Error refreshing lock ${lockName}: ${error}`);
 							// Also stop on errors
 							stopHeartbeat();
 						}
@@ -993,7 +1011,7 @@ export class S3Mutex {
 						try {
 							await Promise.race([releasePromise, timeoutPromise]);
 						} catch (releaseError) {
-							console.warn(
+							this.warn(
 								`Failed to release lock ${lockName}: ${releaseError}`,
 							);
 						}
@@ -1011,7 +1029,7 @@ export class S3Mutex {
 					try {
 						await this.releaseLock(lockName);
 					} catch (error) {
-						console.warn(
+						this.warn(
 							`Failed to release lock ${lockName} in finally block: ${error}`,
 						);
 					}
@@ -1120,9 +1138,9 @@ export class S3Mutex {
 			}
 
 			if (error.$metadata?.httpStatusCode === 503) {
-				console.warn(`S3 service unavailable while deleting lock ${lockName}`);
+				this.warn(`S3 service unavailable while deleting lock ${lockName}`);
 			} else {
-				console.warn(`Error deleting lock ${lockName}: ${error.message}`);
+				this.warn(`Error deleting lock ${lockName}: ${error.message}`);
 			}
 
 			return false;
@@ -1217,7 +1235,7 @@ export class S3Mutex {
 							}
 						}
 					} catch (error) {
-						console.warn(`Error processing lock ${item.Key}: ${error}`);
+						this.warn(`Error processing lock ${item.Key}: ${error}`);
 					}
 				}
 			} while (continuationToken);

@@ -882,6 +882,28 @@ describe("S3Mutex Tests", () => {
 			await otherMutex.releaseLock(otherOwnerLockName);
 		});
 
+		test("routes internal warnings to a provided logger instead of console", async () => {
+			const warnings: Array<{ level: string; message: string }> = [];
+			const loggingMutex = new S3Mutex({
+				s3Client,
+				bucketName: lockBucket,
+				logger: (level, message) => warnings.push({ level, message }),
+			});
+
+			// Releasing a never-created lock warns "not found during release".
+			const released = await loggingMutex.releaseLock(
+				`logger-missing-lock-${Date.now()}`,
+			);
+			expect(released).toBe(false);
+			expect(
+				warnings.some(
+					(w) =>
+						w.level === "warn" &&
+						w.message.includes("not found during release"),
+				),
+			).toBe(true);
+		});
+
 		test("should handle multiple cleanup operations", async () => {
 			const cleanupPrefix = `cleanup-multiple-${Date.now()}/`;
 
